@@ -1,0 +1,286 @@
+name: SA Calculator - Verified Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sa-calculator-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Verify Source, Test and Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Locate or extract latest SA Calculator source
+        id: locate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          APP_DIR=''
+          if [ -s "$GITHUB_WORKSPACE/package.json" ]; then
+            APP_DIR="$GITHUB_WORKSPACE"
+            echo 'Using extracted application at repository root.'
+          else
+            mapfile -t archives < <(
+              find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+                -iname 'SA-Calculator-v*.zip' \
+                -not -path '*/.git/*' \
+                -not -path '*/node_modules/*' \
+                -print | sort -V
+            )
+
+            if [ "${#archives[@]}" -eq 0 ]; then
+              echo '::error::package.json missing and no SA-Calculator-v*.zip archive was found.'
+              echo 'Upload the complete latest source ZIP to the repository root.'
+              exit 1
+            fi
+
+            SELECTED="${archives[${#archives[@]}-1]}"
+            echo "Selected highest-version source archive: $SELECTED"
+            unzip -tq "$SELECTED"
+
+            # Reject absolute paths and parent-directory traversal before extraction.
+            while IFS= read -r entry; do
+              case "$entry" in
+                /*|../*|*/../*|*/..)
+                  echo "::error::Unsafe ZIP entry rejected: $entry"
+                  exit 1
+                  ;;
+              esac
+            done < <(unzip -Z1 "$SELECTED")
+
+            EXTRACT_DIR="$RUNNER_TEMP/sa-calculator-source"
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "$SELECTED" -d "$EXTRACT_DIR"
+
+            mapfile -t manifests < <(
+              find "$EXTRACT_DIR" -maxdepth 12 -type f -name package.json \
+                -not -path '*/node_modules/*' \
+                -not -path '*/www/*' \
+                -not -path '*/android/*' \
+                -not -path '*/.git/*' -print | sort
+            )
+
+            if [ "${#manifests[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one application package.json; found ${#manifests[@]}."
+              printf 'Found manifest: %s\n' "${manifests[@]}"
+              exit 1
+            fi
+            APP_DIR="$(dirname "${manifests[0]}")"
+          fi
+
+          APP_DIR="$(realpath "$APP_DIR")"
+          test -s "$APP_DIR/package.json" || {
+            echo '::error::package.json missing from the selected application root.'
+            exit 1
+          }
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "Verified application root: $APP_DIR"
+
+      - name: Verify source files and project configuration
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required_files=(
+            package.json
+            capacitor.config.json
+            index.html
+            server.js
+            service-worker.js
+            manifest.webmanifest
+            assets/js/app.js
+            assets/js/localization.js
+            assets/js/currency-localized-names.js
+            assets/js/theme-bootstrap.js
+            assets/css/app.css
+            assets/brand/sa-calculator-icon.png
+            scripts/prepare-android-web.mjs
+            scripts/patch-android-native.mjs
+            assets/brand/android-icons/mipmap-anydpi-v26/ic_launcher.xml
+          )
+          for file in "${required_files[@]}"; do
+            if [ ! -s "$file" ]; then
+              echo "::error::Required source file missing or empty: $file"
+              exit 1
+            fi
+          done
+          test -d tests || { echo '::error::Regression tests directory missing.'; exit 1; }
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (p.name !== 'sa-calculator') throw new Error(`Unexpected package name: ${p.name}`);
+          for (const script of ['test', 'build:web']) {
+            if (!p.scripts?.[script]) throw new Error(`Missing npm script: ${script}`);
+          }
+          for (const dependency of ['@capacitor/core', '@capacitor/android']) {
+            if (!p.dependencies?.[dependency]) throw new Error(`Missing dependency: ${dependency}`);
+          }
+          if (!p.devDependencies?.['@capacitor/cli']) throw new Error('Missing @capacitor/cli devDependency');
+          const c = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          if (c.webDir !== 'www') throw new Error(`Expected Capacitor webDir www, got ${c.webDir}`);
+          console.log(`Verified ${p.name} ${p.version}`);
+          NODE
+
+      - name: Verify Android SDK availability
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+            echo '::error::Android SDK is not installed or ANDROID_HOME/ANDROID_SDK_ROOT is invalid.'
+            exit 1
+          fi
+          echo "Android SDK found at $SDK"
+
+      - name: Install npm dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm install --no-audit --no-fund --fetch-retries=5 --fetch-timeout=120000
+
+      - name: Verify installed dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm ls --depth=0
+
+      - name: Validate JavaScript syntax
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --check assets/js/app.js
+          node --check assets/js/localization.js
+          node --check assets/js/currency-localized-names.js
+          node --check assets/js/theme-bootstrap.js
+          node --check server.js
+          node --check service-worker.js
+          node --check scripts/prepare-android-web.mjs
+
+      - name: Run complete regression tests
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm test
+
+      - name: Build Android web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm run build:web
+
+      - name: Verify generated Android web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required_assets=(
+            www/index.html
+            www/service-worker.js
+            www/manifest.webmanifest
+            www/assets/js/app.js
+            www/assets/js/localization.js
+            www/assets/js/currency-localized-names.js
+            www/assets/js/theme-bootstrap.js
+            www/assets/css/app.css
+            www/assets/brand/sa-calculator-icon.png
+          )
+          for asset in "${required_assets[@]}"; do
+            if [ ! -s "$asset" ]; then
+              echo "::error::Generated Android web asset missing or empty: $asset"
+              exit 1
+            fi
+          done
+          echo 'All generated Android web assets verified.'
+
+      - name: Generate Android project if missing
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -s android/gradlew ]; then
+            echo 'Existing Android Gradle wrapper found.'
+          elif [ ! -e android ]; then
+            npx cap add android
+          else
+            echo '::error::android directory exists but gradlew is missing; refusing destructive replacement.'
+            exit 1
+          fi
+
+      - name: Sync Capacitor Android
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npx cap sync android
+
+      - name: Apply premium Android launcher icon and system bar styling
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm run android:brand
+
+      - name: Verify Gradle wrapper
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s gradlew
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Android debug APK
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK and checksum
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          APK='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          unzip -tq "$APK"
+          unzip -Z1 "$APK" | grep -q '^AndroidManifest.xml$'
+          sha256sum "$APK"
+          ls -lh "$APK"
+
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-Debug-APK
+          path: ${{ steps.locate.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Print failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo 'Build failed. Review the first red step above for the originating error.'
+          echo "Runner: $RUNNER_OS"
+          node --version || true
+          npm --version || true
+          java -version || true
+          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
